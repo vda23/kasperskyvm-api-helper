@@ -19,7 +19,7 @@ fi
 set -Eeuo pipefail
 shopt -s nullglob
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly SCRIPT_NAME="${0##*/}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
@@ -40,6 +40,11 @@ declare -Ar LABELS=([assets]="Активы" [vulnerabilities]="Уязвимос�
 KSC_ADDR="" KVM_ADDR="" KSC_USER="" KSC_PASS="${KSC_PASSWORD:-}"
 PAGE_SIZE=$MAX_PAGE_SIZE OUT_DIR=$SCRIPT_DIR CACERT="" RUN_TYPE=""
 TOKEN="" WORK_DIR=""
+# Фильтры выгрузки (пусто — без фильтра)
+F_IP="" F_IMPORTANCE="" F_PRIORITY="" F_NAME=""
+API_FILTERS="" LOCAL_FILTER="" FILTER_DESC=""
+readonly IMPORTANCE_NAMES=("не задана" "низкая" "средняя" "высокая" "критическая")
+readonly PRIORITY_NAMES=("не задан" "низкий" "средний" "высокий" "критический")
 TLS_OPTS=()
 
 # ──────────────────────────────── Оформление ────────────────────────────────
@@ -98,12 +103,23 @@ usage() {
   -h, --help          Эта справка
   -V, --version       Версия
 
+Фильтры (в меню скрипт спросит их сам):
+  --ip СПИСОК         Активы: IP-адреса через запятую или часть адреса, например 10.68.
+  --importance N[,N]  Активы: значимость, 4 — критическая, 3 — высокая, 2 — средняя,
+                      1 — низкая, 0 — не задана
+  --priority N[,N]    Уязвимости: приоритет устранения, 4 — критический … 0 — не задан
+  --name ТЕКСТ        ПО: имя или его часть, без учёта регистра (python найдёт python3-pexpect)
+
+Если для активов заданы и IP, и значимость, выгружаются активы, подходящие под оба условия.
+
 Пароль спрашивается при запуске; для автоматического режима его можно передать
 в переменной окружения KSC_PASSWORD.
 
 Примеры:
   ./${SCRIPT_NAME}
   ./${SCRIPT_NAME} --ksc ksc.corp.local -u admin -t vulnerabilities
+  ./${SCRIPT_NAME} --ksc ksc.corp.local -u admin -t vulnerabilities --priority 4,3
+  ./${SCRIPT_NAME} --ksc ksc.corp.local -u admin -t software --name python
   KSC_PASSWORD='***' ./${SCRIPT_NAME} --ksc ksc.corp.local --kvm kvm.corp.local -u admin -t all
 EOF
 }
@@ -189,6 +205,14 @@ fmt_dur() {
   if (( s >= 60 )); then printf '%d мин %02d с' $(( s / 60 )) $(( s % 60 )); else printf '%d с' "$s"; fi
 }
 
+plural() {  # plural N "запись" "записи" "записей"
+  local n=$(( $1 % 100 )) m=$(( $1 % 10 ))
+  if (( n >= 11 && n <= 14 )); then printf '%s' "$4"
+  elif (( m == 1 )); then printf '%s' "$2"
+  elif (( m >= 2 && m <= 4 )); then printf '%s' "$3"
+  else printf '%s' "$4"; fi
+}
+
 file_size() { stat -c %s -- "$1" 2>/dev/null || wc -c < "$1"; }
 
 strip_scheme() { local a=${1#http://}; a=${a#https://}; printf '%s' "${a%%/*}"; }
@@ -239,6 +263,12 @@ confirm() {  # confirm "Вопрос" -> 0, если ответ «да» (по �
   local a=""
   read -rp "  $1 ${C_DIM}[Д/н]${C_RESET}: " a || return 1
   [[ -z $a || $a =~ ^[ДдYy] ]]
+}
+
+confirm_no() {  # confirm_no "Вопрос" -> 0, если ответ «да» (по умолчанию «нет»)
+  local a=""
+  read -rp "  $1 ${C_DIM}[д/Н]${C_RESET}: " a || return 1
+  [[ $a =~ ^[ДдYy] ]]
 }
 
 spin() {  # spin "Подпись" команда... — крутит индикатор, пока идёт команда
@@ -321,10 +351,11 @@ end_session() {
   TOKEN=""
 }
 
-fetch_page() {  # fetch_page URL СТРАНИЦА ФАЙЛ "Подпись"
-  local url=$1 page=$2 out=$3 label=$4 code="" attempt head
+fetch_page() {  # fetch_page URL СТРАНИЦА ФАЙЛ "Подпись" — фильтры берутся из API_FILTERS
+  local url=$1 page=$2 out=$3 label=$4 code="" attempt head body
+  body="{\"page\": ${page}, \"pageSize\": ${PAGE_SIZE}${API_FILTERS:+, \"filters\": ${API_FILTERS}}}"
   for attempt in 1 2; do
-    if ! code=$(spin "$label" api_post "$url" "$out" "{\"page\": ${page}, \"pageSize\": ${PAGE_SIZE}}" "X-KSC-Session: ${TOKEN}"); then
+    if ! code=$(spin "$label" api_post "$url" "$out" "$body" "X-KSC-Session: ${TOKEN}"); then
       err "Нет связи с Kaspersky VM: ${url}$(tls_hint)"
       return 1
     fi
@@ -340,21 +371,166 @@ fetch_page() {  # fetch_page URL СТРАНИЦА ФАЙЛ "Подпись"
   done
 }
 
+# ──────────────────────────────── Фильтры ────────────────────────────────
+
+json_str() {  # json_str ТЕКСТ -> "текст" с экранированием для JSON
+  local s
+  s=$(printf '%s' "$1" | tr -d '[:cntrl:]')
+  s=${s//\\/\\\\}
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+is_full_ip() {  # полный IPv4 или IPv6-адрес
+  [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $1 =~ ^[0-9A-Fa-f]*:[0-9A-Fa-f]*:[0-9A-Fa-f:.]*$ ]]
+}
+
+ip_filter_item() {  # ip_filter_item "10.0.0.1,10.0.0.2" | "10.68." -> элемент фильтра API
+  local raw=${1// /} item list="" items=()
+  IFS=',' read -ra items <<<"$raw"
+  if (( ${#items[@]} == 1 )) && ! is_full_ip "${items[0]}"; then
+    [[ ${items[0]} =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    printf '{"op":"contains","v":"%s"}' "${items[0]}"
+    return 0
+  fi
+  (( ${#items[@]} > 0 )) || return 1
+  for item in "${items[@]}"; do
+    is_full_ip "$item" || return 1
+    list+="${list:+,}\"${item}\""
+  done
+  printf '{"op":"include","v":[%s]}' "$list"
+}
+
+ip_desc() {  # человекочитаемое описание фильтра по IP
+  local raw=${1// /}
+  if [[ $raw != *,* ]] && ! is_full_ip "$raw"; then printf 'IP содержит «%s»' "$raw"; else printf 'IP: %s' "${raw//,/, }"; fi
+}
+
+norm_levels() {  # "3, 4,3" -> "4,3"; пусто и код 1, если есть значения вне 0–4
+  local raw=${1// /}
+  [[ $raw =~ ^[0-4](,[0-4])*$ ]] || return 1
+  printf '%s' "$raw" | tr ',' '\n' | sort -rnu | paste -sd, -
+}
+
+level_names() {  # level_names "4,3" importance|priority -> "критическая, высокая"
+  local v out="" names=()
+  if [[ $2 == importance ]]; then names=("${IMPORTANCE_NAMES[@]}"); else names=("${PRIORITY_NAMES[@]}"); fi
+  for v in ${1//,/ }; do out+="${out:+, }${names[v]}"; done
+  printf '%s' "$out"
+}
+
+can_filter_locally() { have python3 || have jq; }
+
+ask_opt() {  # ask_opt ПЕРЕМЕННАЯ "Вопрос" — необязательный ввод, Enter — пропустить
+  local ans=""
+  read -rp "  $2 ${C_DIM}[Enter — пропустить]${C_RESET}: " ans || die "Ввод прерван."
+  printf -v "$1" '%s' "$(trim "$ans")"
+}
+
+ask_filters() {  # ask_filters ТИП — спрашивает фильтры для одного типа данных
+  local v=""
+  case $1 in
+    assets)
+      printf '\n  %s\n' "${C_BOLD}Фильтры для активов${C_RESET}" >&2
+      while true; do
+        ask_opt v "IP-адрес: полный (можно несколько через запятую) или часть, например 10.68."
+        if [[ -z $v ]] || ip_filter_item "$v" >/dev/null; then F_IP=${v// /}; break; fi
+        warn "Не похоже на IP-адрес. Примеры: 10.0.0.5 | 10.0.0.5, 10.0.0.6 | 10.68."
+      done
+      info "Значимость: 4 — критическая, 3 — высокая, 2 — средняя, 1 — низкая, 0 — не задана"
+      while true; do
+        ask_opt v "Значимость, одно или несколько значений через запятую"
+        if [[ -z $v ]]; then F_IMPORTANCE=""; break; fi
+        if F_IMPORTANCE=$(norm_levels "$v"); then
+          if [[ -n $F_IP ]] && ! can_filter_locally; then
+            warn "Для сочетания IP и значимости нужен python3 или jq. Оставьте только один фильтр."
+            F_IMPORTANCE=""
+            continue
+          fi
+          break
+        fi
+        warn "Допустимы числа от 0 до 4 через запятую, например 4,3"
+      done
+      ;;
+    vulnerabilities)
+      printf '\n  %s\n' "${C_BOLD}Фильтры для уязвимостей${C_RESET}" >&2
+      info "Приоритет устранения: 4 — критический, 3 — высокий, 2 — средний, 1 — низкий, 0 — не задан"
+      while true; do
+        ask_opt v "Приоритет, одно или несколько значений через запятую"
+        if [[ -z $v ]]; then F_PRIORITY=""; break; fi
+        if F_PRIORITY=$(norm_levels "$v"); then break; fi
+        warn "Допустимы числа от 0 до 4 через запятую, например 4,3"
+      done
+      ;;
+    software)
+      printf '\n  %s\n' "${C_BOLD}Фильтры для ПО${C_RESET}" >&2
+      ask_opt F_NAME "Имя ПО или его часть, регистр не важен (например, python)"
+      ;;
+  esac
+}
+
+build_filters() {  # build_filters ТИП — заполняет API_FILTERS, LOCAL_FILTER и FILTER_DESC
+  local parts=() desc=()
+  API_FILTERS="" LOCAL_FILTER="" FILTER_DESC=""
+  case $1 in
+    assets)
+      if [[ -n $F_IP ]]; then
+        parts+=("\"ipAddresses\":[$(ip_filter_item "$F_IP")]")
+        desc+=("$(ip_desc "$F_IP")")
+      fi
+      if [[ -n $F_IMPORTANCE ]]; then
+        # API объединяет разные поля фильтра через ИЛИ. Чтобы получить «IP И значимость»,
+        # по IP фильтрует сервер, а по значимости — скрипт при сборке файла.
+        if [[ -n $F_IP ]]; then
+          LOCAL_FILTER="importance:${F_IMPORTANCE}"
+        else
+          parts+=("\"importance\":[{\"op\":\"=\",\"v\":[${F_IMPORTANCE}]}]")
+        fi
+        desc+=("значимость: $(level_names "$F_IMPORTANCE" importance)")
+      fi
+      ;;
+    vulnerabilities)
+      if [[ -n $F_PRIORITY ]]; then
+        parts+=("\"priority\":[{\"op\":\"=\",\"v\":[${F_PRIORITY}]}]")
+        desc+=("приоритет: $(level_names "$F_PRIORITY" priority)")
+      fi
+      ;;
+    software)
+      if [[ -n $F_NAME ]]; then
+        parts+=("\"name\":[{\"op\":\"contains\",\"v\":$(json_str "$F_NAME")}]")
+        desc+=("имя содержит «${F_NAME}»")
+      fi
+      ;;
+  esac
+  if (( ${#parts[@]} )); then API_FILTERS="{$(IFS=,; printf '%s' "${parts[*]}")}"; fi
+  if (( ${#desc[@]} )); then
+    FILTER_DESC=${desc[0]}
+    if (( ${#desc[@]} > 1 )); then FILTER_DESC+=" и ${desc[1]}"; fi
+  fi
+}
+
+clear_filters() { F_IP="" F_IMPORTANCE="" F_PRIORITY="" F_NAME=""; }
+
 # ──────────────────────────────── Выгрузка ────────────────────────────────
 
-merge_pages() {  # merge_pages ПАПКА ФАЙЛ ОЖИДАЕМО — пишет {"data":[...], и печатает число записей
-  local dir=$1 out=$2 expected=$3 f sep="" head tail
+merge_pages() {  # merge_pages ПАПКА ФАЙЛ ОЖИДАЕМО [ПОЛЕ:ЗНАЧЕНИЯ] — пишет {"data":[...], и печатает число записей
+  local dir=$1 out=$2 expected=$3 local_filter=${4:-} f sep="" head tail
   local files=("$dir"/*.json)
   if have python3; then
-    python3 - "$out" "${files[@]}" <<'PY'
+    python3 - "$out" "$local_filter" "${files[@]}" <<'PY'
 import json, sys
-out, files = sys.argv[1], sys.argv[2:]
+out, flt, files = sys.argv[1], sys.argv[2], sys.argv[3:]
+key, allowed = None, None
+if flt:
+    key, values = flt.split(":", 1)
+    allowed = {int(v) for v in values.split(",")}
 n = 0
 with open(out, "w", encoding="utf-8") as o:
     o.write('{"data":[')
     for path in files:
         with open(path, encoding="utf-8") as fh:
             for item in json.load(fh).get("data", []):
+                if key and item.get(key) not in allowed:
+                    continue
                 if n:
                     o.write(",")
                 json.dump(item, o, ensure_ascii=False, separators=(",", ":"))
@@ -363,13 +539,19 @@ with open(out, "w", encoding="utf-8") as o:
 print(n)
 PY
   elif have jq; then
-    {
-      printf '{"data":['
-      for f in "${files[@]}"; do jq -c '.data[]' "$f"; done | paste -sd, -
-      printf '],'
-    } > "$out"
-    for f in "${files[@]}"; do jq '.data | length' "$f"; done | awk '{ s += $1 } END { print s + 0 }'
+    local ndjson="${dir}/items.ndjson" key="" values="[]"
+    if [[ -n $local_filter ]]; then key=${local_filter%%:*}; values="[${local_filter#*:}]"; fi
+    for f in "${files[@]}"; do
+      jq -c --arg k "$key" --argjson a "$values" \
+        '.data[] | select($k == "" or (.[$k] as $v | $a | index($v)) != null)' "$f"
+    done > "$ndjson"
+    { printf '{"data":['; paste -sd, - < "$ndjson"; printf '],'; } > "$out"
+    wc -l < "$ndjson" | tr -d ' '
   else
+    if [[ -n $local_filter ]]; then
+      err "Для сочетания фильтров нужен python3 или jq."
+      return 1
+    fi
     printf '{"data":[' > "$out"
     for f in "${files[@]}"; do
       head=$(head -c 25 -- "$f")
@@ -394,8 +576,10 @@ export_type() {  # export_type assets|vulnerabilities|software
   local label=${LABELS[$type]} url="${KVM_ADDR}${ENDPOINTS[$type]}"
   local dir="${WORK_DIR}/${type}" page=1 pages=1 total=0 got f t_start=$SECONDS t_page step out count=""
 
+  build_filters "$type"
   title "${label}"
   info "POST ${url}"
+  if [[ -n $FILTER_DESC ]]; then info "Фильтр: ${C_BOLD}${FILTER_DESC}${C_RESET}"; fi
   rm -rf -- "$dir"
   mkdir -p -- "$dir"
 
@@ -411,9 +595,14 @@ export_type() {  # export_type assets|vulnerabilities|software
         err "В ответе нет meta.pagination.total, не могу посчитать число страниц."
         return 1
       fi
+      if (( total == 0 )); then
+        rm -rf -- "$dir"
+        warn "${label}: по заданным условиям ничего не найдено, файл не создан."
+        return 0
+      fi
       pages=$(( (total + PAGE_SIZE - 1) / PAGE_SIZE ))
       if (( pages < 1 )); then pages=1; fi
-      info "На сервере ${C_BOLD}$(fmt_num "$total")${C_RESET} записей: ${pages} стр. по $(fmt_num "$PAGE_SIZE")"
+      info "На сервере ${C_BOLD}$(fmt_num "$total")${C_RESET} $(plural "$total" запись записи записей): ${pages} стр. по $(fmt_num "$PAGE_SIZE")"
     fi
 
     got=$(( page * PAGE_SIZE < total ? page * PAGE_SIZE : total ))
@@ -422,19 +611,24 @@ export_type() {  # export_type assets|vulnerabilities|software
   done
 
   out="${OUT_DIR}/kasperskyvm_${type}_$(date +%Y-%m-%d_%H-%M-%S).json"
-  if ! count=$(spin "Собираю единый JSON-файл…" merge_pages "$dir" "${out}.part" "$total"); then
+  if ! count=$(spin "Собираю единый JSON-файл…" merge_pages "$dir" "${out}.part" "$total" "$LOCAL_FILTER"); then
     rm -f -- "${out}.part"
     err "Не удалось собрать файл."
     return 1
   fi
-  printf '"meta":{"type":"%s","source":"%s","exportedAt":"%s","total":%s,"count":%s,"pages":%s}}\n' \
-    "$type" "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$total" "$count" "$pages" >> "${out}.part"
+  local local_json="null"
+  if [[ -n $LOCAL_FILTER ]]; then local_json="{\"${LOCAL_FILTER%%:*}\":[${LOCAL_FILTER#*:}]}"; fi
+  printf '"meta":{"type":"%s","source":"%s","exportedAt":"%s","filters":%s,"localFilter":%s,"total":%s,"count":%s,"pages":%s}}\n' \
+    "$type" "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${API_FILTERS:-null}" "$local_json" \
+    "$total" "$count" "$pages" >> "${out}.part"
   mv -f -- "${out}.part" "$out"
   rm -rf -- "$dir"
 
-  ok "${label}: ${C_BOLD}$(fmt_num "$count")${C_RESET} записей за $(fmt_dur $(( SECONDS - t_start )))"
+  ok "${label}: ${C_BOLD}$(fmt_num "$count")${C_RESET} $(plural "$count" запись записи записей) за $(fmt_dur $(( SECONDS - t_start )))"
   ok "Файл: ${C_BOLD}${out}${C_RESET} ${C_DIM}($(fmt_size "$(file_size "$out")"))${C_RESET}"
-  if [[ $count != "$total" ]]; then
+  if [[ -n $LOCAL_FILTER ]]; then
+    info "Из $(fmt_num "$total") $(plural "$total" актива активов активов) с подходящим IP по значимости отобрано $(fmt_num "$count")."
+  elif [[ $count != "$total" ]]; then
     warn "Сервер сообщил $(fmt_num "$total") записей: данные могли измениться во время выгрузки."
   fi
 }
@@ -470,6 +664,15 @@ parse_args() {
       -u|--user)      KSC_USER=$v ;;
       -t|--type)      [[ $v =~ ^(assets|vulnerabilities|software|all)$ ]] || die "Тип: assets, vulnerabilities, software или all."
                       RUN_TYPE=$v ;;
+      --ip)           ip_filter_item "$v" >/dev/null || die "Неверный фильтр IP: $v"
+                      F_IP=${v// /} ;;
+      --importance)   F_IMPORTANCE=$(norm_levels "$v") || die "Значимость: числа от 0 до 4 через запятую."
+                      ;;
+      --priority)     F_PRIORITY=$(norm_levels "$v") || die "Приоритет: числа от 0 до 4 через запятую."
+                      ;;
+      --name)         F_NAME=$(trim "$v")
+                      [[ -n $F_NAME ]] || die "Пустое имя ПО."
+                      ;;
       -s|--page-size) [[ $v =~ ^[0-9]+$ ]] && (( v >= 1 && v <= MAX_PAGE_SIZE )) || die "Размер страницы: от 1 до ${MAX_PAGE_SIZE}."
                       PAGE_SIZE=$v ;;
       -o|--output)    [[ -d $v ]] || die "Папка не найдена: $v"
@@ -484,7 +687,7 @@ parse_args() {
 
 check_deps() {
   local c missing=()
-  for c in curl base64 grep sed head tail cut awk mktemp date tr; do
+  for c in curl base64 grep sed head tail cut awk mktemp date tr sort paste; do
     have "$c" || missing+=("$c")
   done
   if (( ${#missing[@]} )); then die "Не найдены утилиты: ${missing[*]}"; fi
@@ -533,6 +736,14 @@ menu_item() {  # menu_item КЛАВИША "Пункт" ["пояснение"] �
   printf '  %s  %s%*s%s\n' "${C_BOLD}$1${C_RESET}" "$2" "$pad" '' "${3:+${C_DIM}$3${C_RESET}}" >&2
 }
 
+choose_filters() {  # choose_filters ТИП... — спрашивает, нужны ли фильтры, и какие
+  local t
+  clear_filters
+  printf '\n' >&2
+  confirm_no "Задать фильтры?" || return 0
+  for t in "$@"; do ask_filters "$t"; done
+}
+
 run_interactive() {
   local choice=""
   [[ -t 0 ]] || die "Для меню нужен терминал. Для автоматического режима используйте -t (см. --help)."
@@ -541,8 +752,8 @@ run_interactive() {
     show_menu
     read -rp "  Ваш выбор: " choice || { printf '\n' >&2; break; }
     case $(trim "$choice") in
-      1|2|3) run_export "${TYPES[choice - 1]}" || true ;;
-      4)     run_export all || true ;;
+      1|2|3) choose_filters "${TYPES[choice - 1]}"; run_export "${TYPES[choice - 1]}" || true ;;
+      4)     choose_filters "${TYPES[@]}"; run_export all || true ;;
       5)     end_session; configure_interactive ;;
       0|q|Q) break ;;
       *)     warn "Нет такого пункта: введите число от 0 до 5." ;;
@@ -559,6 +770,9 @@ run_batch() {
   if [[ -z $KSC_PASS ]]; then
     [[ -t 0 ]] || die "Нет пароля: передайте его в переменной KSC_PASSWORD."
     ask_secret KSC_PASS "Пароль KSC для ${KSC_USER}"
+  fi
+  if [[ -n $F_IP && -n $F_IMPORTANCE ]] && ! can_filter_locally; then
+    die "Для сочетания --ip и --importance нужен python3 или jq."
   fi
   start_session || exit 1
   local failed=0
