@@ -1,0 +1,7 @@
+# Результаты выгрузки и временные файлы скрипта
+kasperskyvm_*.json
+.kasperskyvm_api_helper.*/
+# Сертификаты и ключи
+*.pem
+*.crt
+*.key
